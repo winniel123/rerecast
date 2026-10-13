@@ -208,6 +208,11 @@ fn divide_poly(
     if in_vert_count > 12 {
         return Err(PolygonDivisionError::TooManyVertices(in_vert_count));
     } else if in_vert_count == 0 {
+        // Like Recast's `dividePoly`, an empty polygon divides into two empty ones. The
+        // callers reuse these counts, so leaving them stale rasterizes a polygon left over
+        // in their scratch buffers into cells the triangle never touches.
+        *out_vert_count_1 = 0;
+        *out_vert_count_2 = 0;
         return Ok(());
     }
     let in_vert_count = in_vert_count as usize;
