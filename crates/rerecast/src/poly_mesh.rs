@@ -1061,7 +1061,7 @@ fn triangulate(
                 let p2 = verts[indices[next(i1, n)] & INDEX_MASK].0;
 
                 let d = p2.as_ivec3() - p0.as_ivec3();
-                let len = d.xz().length_squared() as u16;
+                let len = d.xz().length_squared();
                 if min_len.is_none_or(|min| len < min) {
                     min_len = Some(len);
                     mini = Some(i);
@@ -1085,7 +1085,7 @@ fn triangulate(
                     let p0 = verts[indices[i] & INDEX_MASK].0;
                     let p2 = verts[indices[next(i2, n)] & INDEX_MASK].0;
                     let d = p2.as_ivec3() - p0.as_ivec3();
-                    let len = d.xz().length_squared() as u16;
+                    let len = d.xz().length_squared();
                     if min_len.is_none_or(|min| len < min) {
                         min_len = Some(len);
                         mini = Some(i);
@@ -1344,4 +1344,46 @@ pub enum PolygonNavmeshError {
         "Invalid contour. This sometimes happens if the contour simplification is too aggressive."
     )]
     InvalidContour,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Triangulates the contour `xz`, its vertices at height 0 in region 0.
+    fn triangulate_xz(xz: &[[u16; 2]]) -> Vec<U16Vec3> {
+        let verts: Vec<_> = xz.iter().map(|&[x, z]| (u16vec3(x, 0, z), 0)).collect();
+        let mut indices: Vec<usize> = (0..verts.len()).collect();
+        let mut tris = alloc::vec![U16Vec3::ZERO; verts.len()];
+        let ntris = triangulate(verts.len(), &verts, &mut indices, &mut tris).unwrap();
+        tris.truncate(ntris);
+        tris
+    }
+
+    #[test]
+    fn triangulate_clips_the_ear_with_the_shorter_diagonal_past_256_cells() {
+        // A rhombus whose diagonals are 264 cells across x (A-C) and 100 cells across z (D-B).
+        // Every vertex is an ear: clipping D or B leaves the 264-cell diagonal A-C, clipping A
+        // or C the 100-cell diagonal D-B. 264² = 69 696 would wrap to 4 160 as a u16 and beat
+        // 100² = 10 000, but Recast compares the exact squares, so the first ear clipped is C
+        // (the first vertex whose ear closes the shorter diagonal), giving D-C-B.
+        let a = [0, 50];
+        let d = [132, 100];
+        let c = [264, 50];
+        let b = [132, 0];
+        let tris = triangulate_xz(&[a, d, c, b]);
+        assert_eq!(tris, [u16vec3(1, 2, 3), u16vec3(0, 1, 3)]);
+    }
+
+    #[test]
+    fn triangulate_loosely_clips_the_ear_with_the_shorter_diagonal_past_256_cells() {
+        // A contour doubling back along one line, out to 264 cells and back. Every area is
+        // zero, so no strict diagonal exists and the loose pass clips every ear. That pass
+        // measures from i to i + 3, which on four vertices is the edge into i: 132 cells into
+        // P0, 264 into P1 and P2, 132 into P3. 264² = 69 696 would wrap to 4 160 as a u16 and
+        // beat 132² = 17 424, but Recast compares the exact squares, so the first ear clipped
+        // is P1 (from i = 0), giving P0-P1-P2.
+        let tris = triangulate_xz(&[[0, 0], [264, 0], [0, 0], [132, 0]]);
+        assert_eq!(tris, [u16vec3(0, 1, 2), u16vec3(0, 2, 3)]);
+    }
 }
