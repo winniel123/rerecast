@@ -6,7 +6,10 @@ use glam::{U16Vec3, Vec3Swizzles};
 
 use crate::{
     Aabb3d, AreaType, CompactHeightfield, RegionId,
-    math::{dir_offset_x, dir_offset_z, distance_squared_between_point_and_line_u16vec2},
+    math::{
+        dir_offset_x, dir_offset_z, distance_squared_between_point_and_line_u16vec2, next, prev,
+    },
+    poly_mesh::{intersect, left, left_on, vequal},
 };
 
 impl CompactHeightfield {
@@ -155,6 +158,7 @@ impl CompactHeightfield {
             }
         }
         cset.contours.resize_with(contour_count, Contour::default);
+        merge_holes(&mut cset.contours);
         cset
     }
 
@@ -514,6 +518,211 @@ fn remove_degenerate_segments(simplified: &mut Vec<(U16Vec3, u32)>) {
             simplified.pop();
         }
         i += 1;
+    }
+}
+
+/// Merges each region's holes into its outline, as the end of Recast's `rcBuildContours`
+/// does. A region that surrounds an obstacle walks one contour round its outside and
+/// another, wound backwards, round the obstacle; triangulated alone, that hole has no ear.
+fn merge_holes(contours: &mut [Contour]) {
+    let is_hole: Vec<bool> = contours
+        .iter()
+        .map(|contour| signed_area(&contour.vertices) < 0)
+        .collect();
+    if !is_hole.contains(&true) {
+        return;
+    }
+
+    // Collect each region's outline and holes. A region is assumed to have one outline.
+    let region_count = contours
+        .iter()
+        .map(|contour| contour.region.bits() as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut outlines = vec![None; region_count];
+    let mut holes = vec![Vec::new(); region_count];
+    for (i, contour) in contours.iter().enumerate() {
+        let region = contour.region.bits() as usize;
+        if is_hole[i] {
+            holes[region].push(i);
+        } else {
+            if outlines[region].is_some() {
+                #[cfg(feature = "tracing")]
+                tracing::error!("Multiple outlines for region {region}.");
+            }
+            outlines[region] = Some(i);
+        }
+    }
+
+    for (region, region_holes) in holes.into_iter().enumerate() {
+        if region_holes.is_empty() {
+            continue;
+        }
+        let Some(outline) = outlines[region] else {
+            // This can happen if the contour becomes self-overlapping because of too
+            // aggressive simplification settings.
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                "Bad outline for region {region}, contour simplification is likely too aggressive."
+            );
+            continue;
+        };
+        merge_region_holes(contours, outline, &region_holes);
+    }
+}
+
+/// A hole of a region, as Recast's `rcContourHole`: its contour and its leftmost vertex,
+/// the lowest in x and then in z.
+struct Hole {
+    contour: usize,
+    leftmost: usize,
+    min: (u16, u16),
+}
+
+/// The signed area of `vertices` across the xz-plane, rounded as Recast's
+/// `calcAreaOfPolygon2D` rounds it: negative for a contour wound backwards.
+fn signed_area(vertices: &[(U16Vec3, u32)]) -> i64 {
+    let n = vertices.len();
+    let twice: i64 = (0..n)
+        .map(|i| {
+            let vi = vertices[i].0.as_i64vec3();
+            let vj = vertices[prev(i, n)].0.as_i64vec3();
+            vi.x * vj.z - vj.x * vi.z
+        })
+        .sum();
+    (twice + 1) / 2
+}
+
+/// Splices each of `holes` into the contour `outline`, from left to right, each by the
+/// shortest diagonal from one of its vertices to an outline vertex that crosses neither the
+/// outline nor the holes left to merge.
+fn merge_region_holes(contours: &mut [Contour], outline: usize, holes: &[usize]) {
+    let mut holes: Vec<Hole> = holes
+        .iter()
+        .map(|&contour| {
+            let (leftmost, min) = contours[contour]
+                .vertices
+                .iter()
+                .map(|(vertex, _)| (vertex.x, vertex.z))
+                .enumerate()
+                .min_by_key(|&(_, min)| min)
+                .expect("a contour has at least three vertices");
+            Hole {
+                contour,
+                leftmost,
+                min,
+            }
+        })
+        .collect();
+    // Recast's `qsort` is unstable; a stable sort keeps ties in contour order.
+    holes.sort_by_key(|hole| hole.min);
+
+    for i in 0..holes.len() {
+        let hole = holes[i].contour;
+        let hole_len = contours[hole].vertices.len();
+        let mut best_vertex = holes[i].leftmost;
+        let mut outline_vertex = None;
+        for _ in 0..hole_len {
+            // The hole's vertex must be in the cone of three consecutive outline vertices.
+            let corner = contours[hole].vertices[best_vertex].0;
+            let outline_vertices = &contours[outline].vertices;
+            let mut diagonals: Vec<(i64, usize)> = (0..outline_vertices.len())
+                .filter(|&j| in_cone(j, outline_vertices, corner))
+                .map(|j| {
+                    let d = outline_vertices[j].0.as_i64vec3() - corner.as_i64vec3();
+                    (d.x * d.x + d.z * d.z, j)
+                })
+                .collect();
+            // The shortest first, so the connection is as short as possible.
+            diagonals.sort_by_key(|&(distance, _)| distance);
+
+            // Find a diagonal that intersects neither the outline nor the remaining holes.
+            // Recast skips `diags[i].vert` of the outline here where `diags[j].vert` is meant.
+            outline_vertex = diagonals.iter().map(|&(_, j)| j).find(|&j| {
+                let point = outline_vertices[j].0;
+                !intersect_segment_contour(point, corner, Some(j), outline_vertices)
+                    && holes[i..].iter().all(|other| {
+                        let other = &contours[other.contour].vertices;
+                        !intersect_segment_contour(point, corner, None, other)
+                    })
+            });
+            if outline_vertex.is_some() {
+                break;
+            }
+            // Every diagonal from this vertex intersects something: try the next.
+            best_vertex = (best_vertex + 1) % hole_len;
+        }
+
+        let Some(outline_vertex) = outline_vertex else {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Failed to find merge points for region {:?}.",
+                contours[outline].region
+            );
+            continue;
+        };
+        let hole_vertices = core::mem::take(&mut contours[hole].vertices);
+        merge_contours(
+            &mut contours[outline].vertices,
+            &hole_vertices,
+            outline_vertex,
+            best_vertex,
+        );
+    }
+}
+
+/// Splices `hole` into `outline` between outline vertex `ia` and hole vertex `ib`, going
+/// round each from there and back, so both vertices appear twice.
+fn merge_contours(
+    outline: &mut Vec<(U16Vec3, u32)>,
+    hole: &[(U16Vec3, u32)],
+    ia: usize,
+    ib: usize,
+) {
+    let (na, nb) = (outline.len(), hole.len());
+    let mut merged = Vec::with_capacity(na + nb + 2);
+    merged.extend((0..=na).map(|i| outline[(ia + i) % na]));
+    merged.extend((0..=nb).map(|i| hole[(ib + i) % nb]));
+    *outline = merged;
+}
+
+/// Whether the segment from `d0` to `d1` intersects an edge of `vertices`, other than the
+/// edges at vertex `skip` and those sharing an end with the segment.
+fn intersect_segment_contour(
+    d0: U16Vec3,
+    d1: U16Vec3,
+    skip: Option<usize>,
+    vertices: &[(U16Vec3, u32)],
+) -> bool {
+    let n = vertices.len();
+    (0..n).any(|k| {
+        let k1 = next(k, n);
+        if skip == Some(k) || skip == Some(k1) {
+            return false;
+        }
+        let (p0, p1) = (vertices[k].0, vertices[k1].0);
+        if vequal(d0, p0) || vequal(d1, p0) || vequal(d0, p1) || vequal(d1, p1) {
+            return false;
+        }
+        intersect(d0, d1, p0, p1)
+    })
+}
+
+/// Whether `pj` is strictly inside the cone at vertex `i` of `vertices`, between its edges to
+/// the vertices before and after.
+fn in_cone(i: usize, vertices: &[(U16Vec3, u32)], pj: U16Vec3) -> bool {
+    let n = vertices.len();
+    let pi = vertices[i].0;
+    let pi1 = vertices[next(i, n)].0;
+    let pin1 = vertices[prev(i, n)].0;
+
+    // If P[i] is a convex vertex [ i+1 left or on (i-1,i) ].
+    if left_on(pin1, pi, pi1) {
+        left(pi, pj, pin1) && left(pj, pi, pi1)
+    } else {
+        // Assume (i-1,i,i+1) not collinear.
+        // else P[i] is reflex.
+        !(left_on(pi, pj, pi1) && left_on(pj, pi, pin1))
     }
 }
 

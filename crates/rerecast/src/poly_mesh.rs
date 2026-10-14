@@ -1218,13 +1218,13 @@ fn is_diagonal_internal_or_external(
 const INDEX_MASK: usize = 0x0fffffff;
 
 #[inline]
-fn vequal(a: U16Vec3, b: U16Vec3) -> bool {
+pub(crate) fn vequal(a: U16Vec3, b: U16Vec3) -> bool {
     a.xz() == b.xz()
 }
 
 /// Returns true iff segments ab and cd intersect, properly or improperly.
 #[inline]
-fn intersect(a: U16Vec3, b: U16Vec3, c: U16Vec3, d: U16Vec3) -> bool {
+pub(crate) fn intersect(a: U16Vec3, b: U16Vec3, c: U16Vec3, d: U16Vec3) -> bool {
     if intersect_prop(a, b, c, d) {
         return true;
     }
@@ -1251,12 +1251,12 @@ fn collinear(a: U16Vec3, b: U16Vec3, c: U16Vec3) -> bool {
 /// Returns true iff c is strictly to the left of the directed
 /// line through a to b.
 #[inline]
-fn left(a: U16Vec3, b: U16Vec3, c: U16Vec3) -> bool {
+pub(crate) fn left(a: U16Vec3, b: U16Vec3, c: U16Vec3) -> bool {
     area2(a, b, c) < 0
 }
 
 #[inline]
-fn left_on(a: U16Vec3, b: U16Vec3, c: U16Vec3) -> bool {
+pub(crate) fn left_on(a: U16Vec3, b: U16Vec3, c: U16Vec3) -> bool {
     area2(a, b, c) <= 0
 }
 
